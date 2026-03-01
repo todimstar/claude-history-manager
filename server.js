@@ -356,7 +356,7 @@ function softDeleteSession(project, sessionId) {
   return { sessionId, moved, totalSize };
 }
 
-/** 从回收站恢复会话 */
+/** 从回收站恢复会话（兼容普通会话和孤立文件） */
 function restoreSession(sessionId) {
   validateSessionId(sessionId);
   const trashSessionDir = safePath(TRASH_DIR, sessionId);
@@ -366,46 +366,53 @@ function restoreSession(sessionId) {
   if (!fs.existsSync(metaPath)) throw new Error('缺少元数据，无法恢复');
   const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
 
-  const project = meta.project;
+  const project = meta.project; // 孤立文件时为 null
+  const isOrphan = !project;
   const restored = [];
 
-  // 确保项目目录存在
-  ensureDir(safePath(PROJECTS_DIR, project));
+  // 有项目关联时，恢复对话和子代理
+  if (project) {
+    ensureDir(safePath(PROJECTS_DIR, project));
 
-  // 1) 恢复对话
-  const convSrc = path.join(trashSessionDir, 'conversation.jsonl');
-  if (fs.existsSync(convSrc)) {
-    const dest = safePath(PROJECTS_DIR, project, sessionId + '.jsonl');
-    if (fs.existsSync(dest)) throw new Error('目标位置已存在同名会话，恢复中止');
-    fs.renameSync(convSrc, dest);
-    restored.push('conversation');
+    // 1) 恢复对话
+    const convSrc = path.join(trashSessionDir, 'conversation.jsonl');
+    if (fs.existsSync(convSrc)) {
+      const dest = safePath(PROJECTS_DIR, project, sessionId + '.jsonl');
+      if (fs.existsSync(dest)) throw new Error('目标位置已存在同名会话，恢复中止');
+      fs.renameSync(convSrc, dest);
+      restored.push('conversation');
+    }
+
+    // 2) 恢复子代理
+    const subSrc = path.join(trashSessionDir, 'subagents');
+    if (fs.existsSync(subSrc)) {
+      fs.renameSync(subSrc, safePath(PROJECTS_DIR, project, sessionId));
+      restored.push('subagents');
+    }
   }
 
-  // 2) 恢复子代理
-  const subSrc = path.join(trashSessionDir, 'subagents');
-  if (fs.existsSync(subSrc)) {
-    fs.renameSync(subSrc, safePath(PROJECTS_DIR, project, sessionId));
-    restored.push('subagents');
-  }
-
-  // 3) 恢复调试日志
+  // 3) 恢复调试日志（普通会话和孤立文件都可能有）
   const debugSrc = path.join(trashSessionDir, 'debug.txt');
   if (fs.existsSync(debugSrc)) {
     ensureDir(DEBUG_DIR);
-    fs.renameSync(debugSrc, safePath(DEBUG_DIR, sessionId + '.txt'));
+    const dest = safePath(DEBUG_DIR, sessionId + '.txt');
+    if (fs.existsSync(dest)) throw new Error('调试日志目标位置已存在同名文件，恢复中止');
+    fs.renameSync(debugSrc, dest);
     restored.push('debug');
   }
 
-  // 4) 恢复文件历史
+  // 4) 恢复文件历史（普通会话和孤立文件都可能有）
   const fhSrc = path.join(trashSessionDir, 'file-history');
   if (fs.existsSync(fhSrc)) {
     ensureDir(FILE_HISTORY_DIR);
-    fs.renameSync(fhSrc, safePath(FILE_HISTORY_DIR, sessionId));
+    const dest = safePath(FILE_HISTORY_DIR, sessionId);
+    if (fs.existsSync(dest)) throw new Error('文件历史目标位置已存在同名目录，恢复中止');
+    fs.renameSync(fhSrc, dest);
     restored.push('file-history');
   }
 
-  // 5) 恢复 history.jsonl 条目
-  if (meta.removedHistoryLines) {
+  // 5) 恢复 history.jsonl 条目（仅普通会话）
+  if (!isOrphan && meta.removedHistoryLines && meta.removedHistoryLines.length > 0) {
     restoreToHistoryJsonl(meta.removedHistoryLines);
     restored.push('history-index');
   }
@@ -413,7 +420,60 @@ function restoreSession(sessionId) {
   // 6) 清理回收站目录
   fs.rmSync(trashSessionDir, { recursive: true });
 
-  return { sessionId, project, restored };
+  return { sessionId, project: project || '(孤立文件)', restored };
+}
+
+/** 将孤立文件移入回收站（软删除） */
+function softDeleteOrphan(type, sessionId) {
+  validateSessionId(sessionId);
+  const trashSessionDir = safePath(TRASH_DIR, sessionId);
+
+  // 如果回收站已有同 sessionId 的条目（极端场景：会话被删但孤立文件还在）
+  // 则合并进去；否则新建
+  const metaPath = path.join(trashSessionDir, 'meta.json');
+  let existingMeta = null;
+  if (fs.existsSync(metaPath)) {
+    existingMeta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+  }
+
+  ensureDir(trashSessionDir);
+  const moved = existingMeta ? [...(existingMeta.movedItems || [])] : [];
+  let totalSize = existingMeta ? (existingMeta.totalSize || 0) : 0;
+
+  if (type === 'debug') {
+    const debugPath = safePath(DEBUG_DIR, sessionId + '.txt');
+    if (!fs.existsSync(debugPath)) throw new Error('文件不存在');
+    const size = fs.statSync(debugPath).size;
+    totalSize += size;
+    fs.renameSync(debugPath, path.join(trashSessionDir, 'debug.txt'));
+    if (!moved.includes('debug')) moved.push('debug');
+  } else if (type === 'file-history') {
+    const fhDir = safePath(FILE_HISTORY_DIR, sessionId);
+    if (!fs.existsSync(fhDir)) throw new Error('目录不存在');
+    const size = getDirSize(fhDir);
+    totalSize += size;
+    fs.renameSync(fhDir, path.join(trashSessionDir, 'file-history'));
+    if (!moved.includes('file-history')) moved.push('file-history');
+  }
+
+  // 写/更新 meta.json
+  const meta = existingMeta ? {
+    ...existingMeta,
+    movedItems: moved,
+    totalSize,
+    lastOrphanCleanup: new Date().toISOString()
+  } : {
+    sessionId,
+    project: null,
+    type: `orphan-${type}`,
+    deletedAt: new Date().toISOString(),
+    movedItems: moved,
+    totalSize,
+    removedHistoryLines: []
+  };
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf-8');
+
+  return { sessionId, moved, totalSize, sizeFormatted: formatBytes(totalSize) };
 }
 
 // ─── API 路由 ───────────────────────────────────────────────
@@ -706,35 +766,29 @@ app.get('/api/orphans/file-history', (req, res) => {
   }
 });
 
-/** DELETE /api/orphans/debug/:sid — 删除单个孤立 debug 日志 */
+/** DELETE /api/orphans/debug/:sid — 将孤立 debug 日志移至回收站 */
 app.delete('/api/orphans/debug/:sid', (req, res) => {
   try {
     const sid = validateSessionId(req.params.sid);
-    const fullPath = safePath(DEBUG_DIR, sid + '.txt');
-    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: '文件不存在' });
-    const size = fs.statSync(fullPath).size;
-    fs.unlinkSync(fullPath);
-    res.json({ success: true, freedBytes: size, freedFormatted: formatBytes(size) });
+    const result = softDeleteOrphan('debug', sid);
+    res.json({ success: true, ...result, message: '已移至回收站，可随时恢复' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/** DELETE /api/orphans/file-history/:sid — 删除单个孤立文件历史目录 */
+/** DELETE /api/orphans/file-history/:sid — 将孤立文件历史移至回收站 */
 app.delete('/api/orphans/file-history/:sid', (req, res) => {
   try {
     const sid = validateSessionId(req.params.sid);
-    const fullPath = safePath(FILE_HISTORY_DIR, sid);
-    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: '目录不存在' });
-    const size = getDirSize(fullPath);
-    fs.rmSync(fullPath, { recursive: true });
-    res.json({ success: true, freedBytes: size, freedFormatted: formatBytes(size) });
+    const result = softDeleteOrphan('file-history', sid);
+    res.json({ success: true, ...result, message: '已移至回收站，可随时恢复' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/** POST /api/cleanup/debug — 清理孤立 debug 日志（永久删除） */
+/** POST /api/cleanup/debug — 批量清理孤立 debug 日志（移至回收站） */
 app.post('/api/cleanup/debug', (req, res) => {
   try {
     if (!fs.existsSync(DEBUG_DIR)) return res.json({ cleaned: 0, freedBytes: 0, freedFormatted: '0 B' });
@@ -745,19 +799,20 @@ app.post('/api/cleanup/debug', (req, res) => {
     for (const file of debugFiles) {
       const sid = path.basename(file, '.txt');
       if (!activeSessions.has(sid)) {
-        const fullPath = path.join(DEBUG_DIR, file);
-        freedBytes += fs.statSync(fullPath).size;
-        fs.unlinkSync(fullPath);
-        cleaned.push(sid);
+        try {
+          const result = softDeleteOrphan('debug', sid);
+          freedBytes += result.totalSize;
+          cleaned.push(sid);
+        } catch { /* 跳过单个失败项 */ }
       }
     }
-    res.json({ cleaned: cleaned.length, freedBytes, freedFormatted: formatBytes(freedBytes) });
+    res.json({ cleaned: cleaned.length, freedBytes, freedFormatted: formatBytes(freedBytes), message: '已移至回收站' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/** POST /api/cleanup/file-history — 清理孤立文件历史（永久删除） */
+/** POST /api/cleanup/file-history — 批量清理孤立文件历史（移至回收站） */
 app.post('/api/cleanup/file-history', (req, res) => {
   try {
     if (!fs.existsSync(FILE_HISTORY_DIR)) return res.json({ cleaned: 0, freedBytes: 0, freedFormatted: '0 B' });
@@ -767,13 +822,14 @@ app.post('/api/cleanup/file-history', (req, res) => {
     let freedBytes = 0;
     for (const dir of fhDirs) {
       if (!activeSessions.has(dir.name)) {
-        const fullPath = path.join(FILE_HISTORY_DIR, dir.name);
-        freedBytes += getDirSize(fullPath);
-        fs.rmSync(fullPath, { recursive: true });
-        cleaned.push(dir.name);
+        try {
+          const result = softDeleteOrphan('file-history', dir.name);
+          freedBytes += result.totalSize;
+          cleaned.push(dir.name);
+        } catch { /* 跳过单个失败项 */ }
       }
     }
-    res.json({ cleaned: cleaned.length, freedBytes, freedFormatted: formatBytes(freedBytes) });
+    res.json({ cleaned: cleaned.length, freedBytes, freedFormatted: formatBytes(freedBytes), message: '已移至回收站' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

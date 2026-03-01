@@ -168,12 +168,12 @@ const app = createApp({
     }
 
     // ─── 删除（软删除 → 回收站）─────────────────────
-    const SAFETY_NOTE_SOFT = '<strong>安全保障：</strong>数据将移至回收站（<code>~/.claude/trash/</code>），包括对话记录、调试日志、文件编辑历史和 <code>/resume</code> 索引。<br><strong>如何恢复：</strong>在「回收站」页面点击「恢复」即可原路返回。';
+    const SAFETY_NOTE_SOFT = '<strong>安全保障：</strong>数据将移至回收站（<code>~/.claude/trash/</code>），包括对话记录、调试日志、文件编辑历史和 <code>/resume</code> 索引。<br><strong>如何恢复：</strong>在「回收站」页面点击「恢复」即可原路返回。<br><em>⚠️ 数据无价，建议先确认不再需要。</em>';
 
     function batchDelete() {
       const count = selectedSessions.value.length;
       confirmDialog.title = `移至回收站 — ${count} 个会话`;
-      confirmDialog.message = `选中的 ${count} 个会话将从列表中移除。`;
+      confirmDialog.message = `选中的 ${count} 个会话及其关联文件（调试日志、子代理、文件历史）将一并从列表中移除。`;
       confirmDialog.safetyNote = SAFETY_NOTE_SOFT;
       confirmDialog.btnText = '移至回收站';
       confirmDialog.btnClass = 'btn-warning';
@@ -196,7 +196,7 @@ const app = createApp({
 
     function deleteSingle(project, sessionId) {
       confirmDialog.title = '移至回收站';
-      confirmDialog.message = `会话 ${sessionId.slice(0, 8)}... 将从列表中移除。`;
+      confirmDialog.message = `会话 ${sessionId.slice(0, 8)}... 及其所有关联文件将从列表中移除。`;
       confirmDialog.safetyNote = SAFETY_NOTE_SOFT;
       confirmDialog.btnText = '移至回收站';
       confirmDialog.btnClass = 'btn-warning';
@@ -258,18 +258,18 @@ const app = createApp({
     async function deleteOrphan(item) {
       const type = orphanType.value;
       const label = type === 'debug' ? '调试日志' : '文件历史';
-      confirmDialog.title = `删除孤立${label}`;
-      confirmDialog.message = `将永久删除 Session ${item.sessionId.slice(0, 8)}... 的${label}。`;
-      confirmDialog.safetyNote = `<strong>注意：</strong>这是孤儿文件，对应的会话已不存在。删除后<strong>不可恢复</strong>。`;
-      confirmDialog.btnText = '永久删除';
-      confirmDialog.btnClass = 'btn-danger';
+      confirmDialog.title = `移至回收站 — 孤立${label}`;
+      confirmDialog.message = `Session ${item.sessionId.slice(0, 8)}... 的孤立${label}（${item.sizeFormatted}）将移至回收站。`;
+      confirmDialog.safetyNote = `<strong>安全保障：</strong>文件将移至回收站（<code>~/.claude/trash/</code>），而非直接删除。<br><strong>如何恢复：</strong>在「回收站」页面点击「恢复」即可还原。<br><em>⚠️ 数据无价，虽然这是孤立文件，但建议通过「📂 打开」确认后再操作。</em>`;
+      confirmDialog.btnText = '移至回收站';
+      confirmDialog.btnClass = 'btn-warning';
       confirmDialog.onConfirm = async () => {
         try {
-          const result = await api(`/api/orphans/${type}/${item.sessionId}`, { method: 'DELETE' });
-          toast(`已删除，释放 ${result.freedFormatted}`, 'success');
+          await api(`/api/orphans/${type}/${item.sessionId}`, { method: 'DELETE' });
+          toast(`已移至回收站，可在回收站页面恢复`, 'success');
           openOrphans(type);
         } catch (e) {
-          toast('删除失败: ' + e.message, 'error');
+          toast('操作失败: ' + e.message, 'error');
         }
       };
       confirmDialog.show = true;
@@ -279,18 +279,18 @@ const app = createApp({
       const type = orphanType.value;
       const label = type === 'debug' ? '调试日志' : '文件历史';
       const count = orphanItems.value.length;
-      confirmDialog.title = `清理全部孤立${label} — ${count} 项`;
-      confirmDialog.message = `将永久删除全部 ${count} 个孤立${label}。`;
-      confirmDialog.safetyNote = `<strong>注意：</strong>这些都是"孤儿文件"——对应的会话已不存在，无法通过回收站恢复。但它们也不再有实际用途。`;
-      confirmDialog.btnText = '全部清理';
-      confirmDialog.btnClass = 'btn-danger';
+      confirmDialog.title = `全部移至回收站 — ${count} 个孤立${label}`;
+      confirmDialog.message = `全部 ${count} 个孤立${label}（共 ${orphanTotalSize.value}）将移至回收站。`;
+      confirmDialog.safetyNote = `<strong>安全保障：</strong>所有文件将移至回收站，而非直接删除。可在「回收站」页面逐个检查并恢复。<br><em>⚠️ 数据无价，如果不确定这些文件是否还有用，建议先通过「📂 打开」逐个确认。</em>`;
+      confirmDialog.btnText = '全部移至回收站';
+      confirmDialog.btnClass = 'btn-warning';
       confirmDialog.onConfirm = async () => {
         try {
           const data = await api(`/api/cleanup/${type}`, { method: 'POST' });
-          toast(`已清理 ${data.cleaned} 个孤立${label}，释放 ${data.freedFormatted}`, 'success');
+          toast(`${data.cleaned} 个孤立${label}已移至回收站`, 'success');
           openOrphans(type);
         } catch (e) {
-          toast('清理失败: ' + e.message, 'error');
+          toast('操作失败: ' + e.message, 'error');
         }
       };
       confirmDialog.show = true;
@@ -342,10 +342,10 @@ const app = createApp({
     }
 
     function permanentDelete(sessionId) {
-      confirmDialog.title = '⚠️ 彻底删除';
-      confirmDialog.message = `会话 ${sessionId.slice(0, 8)}... 将被永久删除。`;
-      confirmDialog.safetyNote = '<strong>警告：此操作不可逆！</strong>数据将从磁盘上彻底清除，无法再恢复。请确认你已检查过删除后 Claude Code 运行正常。';
-      confirmDialog.btnText = '彻底删除';
+      confirmDialog.title = '⚠️ 彻底删除 — 不可逆';
+      confirmDialog.message = `会话 ${sessionId.slice(0, 8)}... 将被永久删除，数据将从磁盘上彻底清除。`;
+      confirmDialog.safetyNote = '<strong>⚠️ 警告：此操作不可逆！</strong>数据将从磁盘上彻底清除，无法再恢复。<br><strong>数据无价</strong>——对话记录可能包含重要的代码 diff、调试思路和技术决策。请确认你已检查过内容确实不再需要，且删除后 Claude Code 运行正常。<br><em>建议：先点「恢复」检查内容，确认不需要后再彻底删除。</em>';
+      confirmDialog.btnText = '确认彻底删除';
       confirmDialog.btnClass = 'btn-danger';
       confirmDialog.onConfirm = async () => {
         try {
@@ -361,10 +361,10 @@ const app = createApp({
 
     function purgeTrash() {
       const count = trashData.value.items.length;
-      confirmDialog.title = `⚠️ 清空回收站 — ${count} 项`;
-      confirmDialog.message = `回收站中的全部 ${count} 个会话将被永久删除。`;
-      confirmDialog.safetyNote = '<strong>警告：此操作不可逆！</strong>所有回收站中的数据将从磁盘彻底清除。建议先逐个检查确认不再需要。';
-      confirmDialog.btnText = '全部彻底删除';
+      confirmDialog.title = `⚠️ 清空回收站 — ${count} 项（不可逆）`;
+      confirmDialog.message = `回收站中的全部 ${count} 个条目将被永久删除，磁盘上的数据将被彻底清除。`;
+      confirmDialog.safetyNote = '<strong>⚠️ 警告：此操作不可逆！</strong>所有回收站中的数据将从磁盘彻底清除。<br><strong>数据无价</strong>——这些数据可能包含重要的对话记录、代码修改历史和调试信息。<br><em>建议：先逐个检查每条记录，确认全部不再需要后再清空。误删造成的数据丢失无法挽回。</em>';
+      confirmDialog.btnText = '确认全部彻底删除';
       confirmDialog.btnClass = 'btn-danger';
       confirmDialog.onConfirm = async () => {
         try {

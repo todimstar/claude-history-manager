@@ -67,7 +67,7 @@
             <div class="stat-card">
               <div class="label" style="display:flex;align-items:center;gap:6px">
                 调试日志
-                <span class="help-tip" title="清理「孤立」的调试日志：即对应的会话 .jsonl 已不存在的 debug 文件。这些文件已无法关联到任何对话，可安全删除。此操作不可逆。">?</span>
+                <span class="help-tip" title="查看「孤立」的调试日志：即对应的会话 .jsonl 已不存在的 debug 文件。可选择移至回收站，之后可恢复。">?</span>
                 <button class="btn btn-ghost" style="font-size:11px;padding:2px 8px" @click="cleanupDebug">清理孤立</button>
               </div>
               <div class="value">{{ debugInfo.formatted }}</div>
@@ -76,7 +76,7 @@
             <div class="stat-card">
               <div class="label" style="display:flex;align-items:center;gap:6px">
                 文件历史
-                <span class="help-tip" title="清理「孤立」的文件编辑历史：即对应的会话 .jsonl 已不存在的 file-history 目录。这些版本快照已无法关联到任何对话，可安全删除。此操作不可逆。">?</span>
+                <span class="help-tip" title="查看「孤立」的文件编辑历史：即对应的会话 .jsonl 已不存在的 file-history 目录。可选择移至回收站，之后可恢复。">?</span>
                 <button class="btn btn-ghost" style="font-size:11px;padding:2px 8px" @click="cleanupFileHistory">清理孤立</button>
               </div>
               <div class="value">{{ fileHistoryInfo.formatted }}</div>
@@ -108,6 +108,15 @@
                 <span>💬 {{ proj.sessionCount }} 会话</span>
                 <span>💾 {{ proj.sizeFormatted }}</span>
               </div>
+            </div>
+          </div>
+
+          <!-- 风险提示 -->
+          <div class="knowledge-card" style="margin-top:24px;border-color:var(--warning)">
+            <div class="kc-title">⚠️ 风险提示</div>
+            <div class="kc-body">
+              <p>本工具直接操作 <code>~/.claude/</code> 目录中的文件。所有删除操作（即使是移至回收站）均存在风险。<strong>数据无价</strong>，使用本工具即代表你了解并自愿承担可能的文件/会话丢失风险。</p>
+              <p>本项目由 AI 辅助生成，作者无法对代码的完整性和正确性做出保证。建议操作前备份重要数据。</p>
             </div>
           </div>
         </template>
@@ -281,10 +290,10 @@
         <div class="knowledge-card">
           <div class="kc-title">📋 回收站使用说明</div>
           <div class="kc-body">
-            <p>删除的会话会暂存在此处，包括对话记录、调试日志和文件编辑历史。</p>
+            <p>删除的会话和孤立文件会暂存在此处，包括对话记录、调试日志和文件编辑历史。</p>
             <ul>
-              <li><strong>恢复</strong>：点击「恢复」按钮，数据会原路返回，包括 <code>/resume</code> 索引也会恢复</li>
-              <li><strong>彻底删除</strong>：确认不再需要后，可逐个或一键清空。此操作<em>不可逆</em></li>
+              <li><strong>恢复</strong>：点击「恢复」按钮，数据会原路返回。普通会话会恢复 <code>/resume</code> 索引；孤立文件会恢复到原始目录</li>
+              <li><strong>彻底删除</strong>：确认不再需要后，可逐个或一键清空。此操作<em>不可逆</em>——<strong>数据无价</strong>，请务必三思</li>
               <li><strong>建议</strong>：删除后先用 Claude Code 的 <code>/resume</code> 测试一下是否正常，确认无误再彻底删除</li>
             </ul>
           </div>
@@ -297,7 +306,7 @@
             <div class="trash-body">
               <div class="trash-preview">{{ item.preview }}</div>
               <div class="trash-meta">
-                <span>📁 {{ item.project }}</span>
+                <span>📁 {{ item.project || '(孤立文件)' }}</span>
                 <span>🕐 删除于 {{ formatDate(item.deletedAt) }}</span>
                 <span>💾 {{ item.sizeFormatted }}</span>
                 <span v-for="tag in item.movedItems" :key="tag" class="tag">{{ tag }}</span>
@@ -322,8 +331,8 @@
             <h2>{{ orphanType === 'debug' ? '🐛 孤立调试日志' : '📝 孤立文件历史' }}</h2>
             <span class="badge-info" v-if="orphanTotalSize">共占用 {{ orphanTotalSize }}</span>
           </div>
-          <button class="btn btn-danger" :disabled="orphanItems.length === 0" @click="cleanAllOrphans">
-            全部清理 ({{ orphanItems.length }})
+          <button class="btn btn-warning" :disabled="orphanItems.length === 0" @click="cleanAllOrphans">
+            全部移至回收站 ({{ orphanItems.length }})
           </button>
         </div>
 
@@ -333,12 +342,13 @@
           <div class="kc-body">
             <p v-if="orphanType === 'debug'">
               以下是没有对应会话 <code>.jsonl</code> 的调试日志文件。可能是会话被手动删除或被 Claude Code 自动清理后遗留的。
-              这些文件已无法关联到任何对话，可安全删除。点击「打开」按钮可在文件管理器中查看确认。
+              这些文件已无法关联到任何对话。点击「📂 打开」按钮可在文件管理器中查看确认。
             </p>
             <p v-else>
               以下是没有对应会话 <code>.jsonl</code> 的文件编辑历史目录。每个目录保存了该次会话中 Claude 编辑文件的版本快照。
-              对应的会话已不存在，这些快照已无法关联到任何对话。点击「打开」按钮可在文件管理器中查看内容。
+              对应的会话已不存在，这些快照已无法关联到任何对话。点击「📂 打开」按钮可在文件管理器中查看内容。
             </p>
+            <p><strong>安全说明：</strong>所有操作均为「移至回收站」而非直接删除。你可以随时在回收站中恢复。</p>
           </div>
         </div>
 
@@ -361,7 +371,7 @@
               <button class="btn btn-ghost btn-open" @click.stop="openInExplorer(item.filePath || item.dirPath)" title="在文件管理器中打开">
                 📂 打开
               </button>
-              <button class="btn btn-danger" @click.stop="deleteOrphan(item)">删除</button>
+              <button class="btn btn-warning" @click.stop="deleteOrphan(item)">移至回收站</button>
             </div>
           </div>
         </div>
@@ -428,6 +438,10 @@
               报告了自动清理会误删<em>当天创建</em>的会话。
               <a href="https://github.com/anthropics/claude-code/issues/4172" target="_blank">Issue #4172</a>
               是最早发现此问题的用户报告。</p>
+
+            <p><strong>官方文档：</strong>
+              <a href="https://code.claude.com/docs/en/settings#available-settings" target="_blank">Claude Code Settings — Available Settings</a>
+              中列出了 <code>cleanupPeriodDays</code> 参数的官方说明。</p>
 
             <p><strong>我们的建议：</strong>设为 <strong>365 天</strong>——既保留足够的历史，又不会让磁盘无限膨胀。
               配合本工具的磁盘统计和回收站功能，你可以精细管理空间。</p>
