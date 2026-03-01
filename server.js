@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const readline = require('readline');
+const { exec } = require('child_process');
 
 const app = express();
 const PORT = process.env.CHM_PORT || 3456;
@@ -196,26 +197,63 @@ async function getSessionMeta(filePath) {
   };
 }
 
-/** 从项目中读取真实工作目录路径（解决有损编码问题） */
-async function getProjectDisplayName(projectDir, encodedName) {
+/** Claude Code 目录编码：将真实路径编码为目录名（用于与 history.jsonl 匹配） */
+function encodeProjectPath(realPath) {
+  return realPath
+    .replace(/[\\\/]+$/, '')
+    .replace(/\\/g, '/')
+    .replace(/^([A-Za-z]):\//, (_, letter) => letter.toLowerCase() + '--')
+    .replace(/\//g, '-');
+}
+
+/** 从 history.jsonl 构建 encodedDirName → realPath 映射（无损） */
+function buildProjectPathMap() {
+  const map = new Map();
   try {
-    const files = fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'));
-    if (files.length === 0) return encodedName;
-    const stream = fs.createReadStream(path.join(projectDir, files[0]), { encoding: 'utf-8' });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
+    if (!fs.existsSync(HISTORY_FILE)) return map;
+    const raw = fs.readFileSync(HISTORY_FILE, 'utf-8');
+    for (const line of raw.split('\n')) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
-        if (obj.cwd) {
-          rl.close();
-          stream.destroy();
-          return obj.cwd;
+        if (obj.project) {
+          const encoded = encodeProjectPath(obj.project);
+          if (!map.has(encoded)) map.set(encoded, obj.project);
         }
       } catch {}
     }
   } catch {}
-  // 兜底：正则解码（可能不准确）
+  return map;
+}
+
+/** 从项目 JSONL 中提取 cwd（遍历多个文件，每个最多读前 30 行） */
+async function extractCwdFromJsonl(projectDir) {
+  try {
+    const files = fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'));
+    for (const file of files.slice(0, 3)) {
+      const stream = fs.createReadStream(path.join(projectDir, file), { encoding: 'utf-8' });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      let lineCount = 0;
+      for await (const line of rl) {
+        if (!line.trim()) continue;
+        if (++lineCount > 30) break;
+        try {
+          const obj = JSON.parse(line);
+          if (obj.cwd) { rl.close(); stream.destroy(); return obj.cwd; }
+        } catch {}
+      }
+      rl.close();
+      stream.destroy();
+    }
+  } catch {}
+  return null;
+}
+
+/** 获取项目显示名（真实路径）— 优先级：history.jsonl > JSONL cwd > 正则解码（有损） */
+async function getProjectDisplayName(projectDir, encodedName, pathMap) {
+  if (pathMap && pathMap.has(encodedName)) return pathMap.get(encodedName);
+  const cwd = await extractCwdFromJsonl(projectDir);
+  if (cwd) return cwd;
   return encodedName.replace(/--/g, ':\\').replace(/-/g, '\\');
 }
 
@@ -385,12 +423,13 @@ app.get('/api/projects', async (req, res) => {
   try {
     if (!fs.existsSync(PROJECTS_DIR)) return res.json([]);
     const entries = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true });
+    const pathMap = buildProjectPathMap();
     const projects = [];
     for (const e of entries.filter(e => e.isDirectory())) {
       const dirPath = path.join(PROJECTS_DIR, e.name);
       const jsonlFiles = fs.readdirSync(dirPath).filter(f => f.endsWith('.jsonl'));
       const size = getDirSize(dirPath);
-      const displayName = await getProjectDisplayName(dirPath, e.name);
+      const displayName = await getProjectDisplayName(dirPath, e.name, pathMap);
       projects.push({
         name: e.name,
         displayName,
@@ -591,16 +630,115 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+/** 收集所有项目中的活跃 session ID */
+function collectActiveSessions() {
+  const active = new Set();
+  if (fs.existsSync(PROJECTS_DIR)) {
+    for (const proj of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true }).filter(e => e.isDirectory())) {
+      fs.readdirSync(path.join(PROJECTS_DIR, proj.name))
+        .filter(f => f.endsWith('.jsonl'))
+        .forEach(f => active.add(path.basename(f, '.jsonl')));
+    }
+  }
+  return active;
+}
+
+/** GET /api/orphans/debug — 列出孤立的 debug 日志（不删除） */
+app.get('/api/orphans/debug', (req, res) => {
+  try {
+    if (!fs.existsSync(DEBUG_DIR)) return res.json({ items: [], totalSize: 0, totalFormatted: '0 B' });
+    const activeSessions = collectActiveSessions();
+    const debugFiles = fs.readdirSync(DEBUG_DIR).filter(f => f.endsWith('.txt'));
+    const items = [];
+    let totalSize = 0;
+    for (const file of debugFiles) {
+      const sid = path.basename(file, '.txt');
+      if (!activeSessions.has(sid)) {
+        const fullPath = path.join(DEBUG_DIR, file);
+        const stat = fs.statSync(fullPath);
+        totalSize += stat.size;
+        items.push({
+          sessionId: sid,
+          fileName: file,
+          filePath: fullPath,
+          size: stat.size,
+          sizeFormatted: formatBytes(stat.size),
+          lastModified: stat.mtime.toISOString()
+        });
+      }
+    }
+    items.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+    res.json({ items, totalSize, totalFormatted: formatBytes(totalSize) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/orphans/file-history — 列出孤立的文件历史目录（不删除） */
+app.get('/api/orphans/file-history', (req, res) => {
+  try {
+    if (!fs.existsSync(FILE_HISTORY_DIR)) return res.json({ items: [], totalSize: 0, totalFormatted: '0 B' });
+    const activeSessions = collectActiveSessions();
+    const fhDirs = fs.readdirSync(FILE_HISTORY_DIR, { withFileTypes: true }).filter(e => e.isDirectory());
+    const items = [];
+    let totalSize = 0;
+    for (const dir of fhDirs) {
+      if (!activeSessions.has(dir.name)) {
+        const fullPath = path.join(FILE_HISTORY_DIR, dir.name);
+        const size = getDirSize(fullPath);
+        const stat = fs.statSync(fullPath);
+        const fileCount = fs.readdirSync(fullPath).length;
+        totalSize += size;
+        items.push({
+          sessionId: dir.name,
+          dirPath: fullPath,
+          size,
+          sizeFormatted: formatBytes(size),
+          fileCount,
+          lastModified: stat.mtime.toISOString()
+        });
+      }
+    }
+    items.sort((a, b) => new Date(b.lastModified) - new Date(a.lastModified));
+    res.json({ items, totalSize, totalFormatted: formatBytes(totalSize) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** DELETE /api/orphans/debug/:sid — 删除单个孤立 debug 日志 */
+app.delete('/api/orphans/debug/:sid', (req, res) => {
+  try {
+    const sid = validateSessionId(req.params.sid);
+    const fullPath = safePath(DEBUG_DIR, sid + '.txt');
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: '文件不存在' });
+    const size = fs.statSync(fullPath).size;
+    fs.unlinkSync(fullPath);
+    res.json({ success: true, freedBytes: size, freedFormatted: formatBytes(size) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** DELETE /api/orphans/file-history/:sid — 删除单个孤立文件历史目录 */
+app.delete('/api/orphans/file-history/:sid', (req, res) => {
+  try {
+    const sid = validateSessionId(req.params.sid);
+    const fullPath = safePath(FILE_HISTORY_DIR, sid);
+    if (!fs.existsSync(fullPath)) return res.status(404).json({ error: '目录不存在' });
+    const size = getDirSize(fullPath);
+    fs.rmSync(fullPath, { recursive: true });
+    res.json({ success: true, freedBytes: size, freedFormatted: formatBytes(size) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /** POST /api/cleanup/debug — 清理孤立 debug 日志（永久删除） */
 app.post('/api/cleanup/debug', (req, res) => {
   try {
     if (!fs.existsSync(DEBUG_DIR)) return res.json({ cleaned: 0, freedBytes: 0, freedFormatted: '0 B' });
-    const activeSessions = new Set();
-    if (fs.existsSync(PROJECTS_DIR)) {
-      for (const proj of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true }).filter(e => e.isDirectory())) {
-        fs.readdirSync(path.join(PROJECTS_DIR, proj.name)).filter(f => f.endsWith('.jsonl')).forEach(f => activeSessions.add(path.basename(f, '.jsonl')));
-      }
-    }
+    const activeSessions = collectActiveSessions();
     const debugFiles = fs.readdirSync(DEBUG_DIR).filter(f => f.endsWith('.txt'));
     const cleaned = [];
     let freedBytes = 0;
@@ -623,12 +761,7 @@ app.post('/api/cleanup/debug', (req, res) => {
 app.post('/api/cleanup/file-history', (req, res) => {
   try {
     if (!fs.existsSync(FILE_HISTORY_DIR)) return res.json({ cleaned: 0, freedBytes: 0, freedFormatted: '0 B' });
-    const activeSessions = new Set();
-    if (fs.existsSync(PROJECTS_DIR)) {
-      for (const proj of fs.readdirSync(PROJECTS_DIR, { withFileTypes: true }).filter(e => e.isDirectory())) {
-        fs.readdirSync(path.join(PROJECTS_DIR, proj.name)).filter(f => f.endsWith('.jsonl')).forEach(f => activeSessions.add(path.basename(f, '.jsonl')));
-      }
-    }
+    const activeSessions = collectActiveSessions();
     const fhDirs = fs.readdirSync(FILE_HISTORY_DIR, { withFileTypes: true }).filter(e => e.isDirectory());
     const cleaned = [];
     let freedBytes = 0;
@@ -655,7 +788,10 @@ app.get('/api/settings', (req, res) => {
     if (fs.existsSync(SETTINGS_FILE)) {
       settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
     }
-    res.json({ cleanupPeriodDays: settings.cleanupPeriodDays ?? 30 });
+    res.json({
+      cleanupPeriodDays: settings.cleanupPeriodDays ?? 30,
+      settingsFilePath: SETTINGS_FILE
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -678,6 +814,37 @@ app.put('/api/settings', (req, res) => {
     fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2), 'utf-8');
     fs.renameSync(tmpPath, SETTINGS_FILE);
     res.json({ success: true, cleanupPeriodDays });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── 文件管理器打开 ─────────────────────────────────────────
+
+/** POST /api/open-path — 在系统文件管理器中打开文件/目录 */
+app.post('/api/open-path', (req, res) => {
+  try {
+    const { filePath: requestedPath } = req.body;
+    if (!requestedPath) return res.status(400).json({ error: 'filePath 必填' });
+
+    const resolved = path.resolve(requestedPath);
+    if (!resolved.startsWith(path.resolve(CLAUDE_DIR))) {
+      return res.status(403).json({ error: '只能打开 .claude 目录内的文件' });
+    }
+    if (!fs.existsSync(resolved)) {
+      return res.status(404).json({ error: '路径不存在: ' + resolved });
+    }
+
+    const isDir = fs.statSync(resolved).isDirectory();
+    if (process.platform === 'win32') {
+      exec(isDir ? `explorer "${resolved}"` : `explorer /select,"${resolved}"`);
+    } else if (process.platform === 'darwin') {
+      exec(isDir ? `open "${resolved}"` : `open -R "${resolved}"`);
+    } else {
+      exec(`xdg-open "${isDir ? resolved : path.dirname(resolved)}"`);
+    }
+
+    res.json({ success: true, path: resolved });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

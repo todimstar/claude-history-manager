@@ -33,6 +33,12 @@ const app = createApp({
     // 设置
     const settingsForm = reactive({ cleanupPeriodDays: 30 });
     const settingsSaving = ref(false);
+    const settingsFilePath = ref('');
+
+    // 孤立文件列表
+    const orphanType = ref('debug'); // 'debug' | 'file-history'
+    const orphanItems = ref([]);
+    const orphanTotalSize = ref('');
 
     // ─── 计算属性 ──────────────────────────────────
     const totalSessions = computed(() => projects.value.reduce((s, p) => s + p.sessionCount, 0));
@@ -235,17 +241,54 @@ const app = createApp({
     }
 
     // ─── 孤立清理 ─────────────────────────────────
-    async function cleanupDebug() {
-      confirmDialog.title = '清理孤立调试日志';
-      confirmDialog.message = '将永久删除没有对应会话的调试日志文件。';
-      confirmDialog.safetyNote = '<strong>注意：</strong>这些是"孤儿文件"——对应的会话已不存在，无法通过回收站恢复。但它们也不再有实际用途。';
-      confirmDialog.btnText = '永久清理';
+    async function openOrphans(type) {
+      orphanType.value = type;
+      currentView.value = 'orphans';
+      loading.value = true;
+      try {
+        const data = await api(`/api/orphans/${type}`);
+        orphanItems.value = data.items;
+        orphanTotalSize.value = data.totalFormatted;
+      } catch (e) {
+        toast('加载孤立列表失败: ' + e.message, 'error');
+      }
+      loading.value = false;
+    }
+
+    async function deleteOrphan(item) {
+      const type = orphanType.value;
+      const label = type === 'debug' ? '调试日志' : '文件历史';
+      confirmDialog.title = `删除孤立${label}`;
+      confirmDialog.message = `将永久删除 Session ${item.sessionId.slice(0, 8)}... 的${label}。`;
+      confirmDialog.safetyNote = `<strong>注意：</strong>这是孤儿文件，对应的会话已不存在。删除后<strong>不可恢复</strong>。`;
+      confirmDialog.btnText = '永久删除';
       confirmDialog.btnClass = 'btn-danger';
       confirmDialog.onConfirm = async () => {
         try {
-          const data = await api('/api/cleanup/debug', { method: 'POST' });
-          toast(`已清理 ${data.cleaned} 个孤立日志，释放 ${data.freedFormatted}`, 'success');
-          loadDashboard();
+          const result = await api(`/api/orphans/${type}/${item.sessionId}`, { method: 'DELETE' });
+          toast(`已删除，释放 ${result.freedFormatted}`, 'success');
+          openOrphans(type);
+        } catch (e) {
+          toast('删除失败: ' + e.message, 'error');
+        }
+      };
+      confirmDialog.show = true;
+    }
+
+    async function cleanAllOrphans() {
+      const type = orphanType.value;
+      const label = type === 'debug' ? '调试日志' : '文件历史';
+      const count = orphanItems.value.length;
+      confirmDialog.title = `清理全部孤立${label} — ${count} 项`;
+      confirmDialog.message = `将永久删除全部 ${count} 个孤立${label}。`;
+      confirmDialog.safetyNote = `<strong>注意：</strong>这些都是"孤儿文件"——对应的会话已不存在，无法通过回收站恢复。但它们也不再有实际用途。`;
+      confirmDialog.btnText = '全部清理';
+      confirmDialog.btnClass = 'btn-danger';
+      confirmDialog.onConfirm = async () => {
+        try {
+          const data = await api(`/api/cleanup/${type}`, { method: 'POST' });
+          toast(`已清理 ${data.cleaned} 个孤立${label}，释放 ${data.freedFormatted}`, 'success');
+          openOrphans(type);
         } catch (e) {
           toast('清理失败: ' + e.message, 'error');
         }
@@ -253,22 +296,26 @@ const app = createApp({
       confirmDialog.show = true;
     }
 
+    async function cleanupDebug() {
+      openOrphans('debug');
+    }
+
     async function cleanupFileHistory() {
-      confirmDialog.title = '清理孤立文件历史';
-      confirmDialog.message = '将永久删除没有对应会话的文件编辑版本快照。';
-      confirmDialog.safetyNote = '<strong>注意：</strong>这些是"孤儿文件"——对应的会话已不存在，文件版本快照已无法关联到任何对话。';
-      confirmDialog.btnText = '永久清理';
-      confirmDialog.btnClass = 'btn-danger';
-      confirmDialog.onConfirm = async () => {
-        try {
-          const data = await api('/api/cleanup/file-history', { method: 'POST' });
-          toast(`已清理 ${data.cleaned} 个孤立目录，释放 ${data.freedFormatted}`, 'success');
-          loadDashboard();
-        } catch (e) {
-          toast('清理失败: ' + e.message, 'error');
-        }
-      };
-      confirmDialog.show = true;
+      openOrphans('file-history');
+    }
+
+    // ─── 文件管理器打开 ──────────────────────────
+    async function openInExplorer(filePath) {
+      try {
+        await api('/api/open-path', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePath })
+        });
+        toast('已在文件管理器中打开', 'success');
+      } catch (e) {
+        toast('打开失败: ' + e.message, 'error');
+      }
     }
 
     // ─── 回收站 ───────────────────────────────────
@@ -337,6 +384,7 @@ const app = createApp({
       try {
         const data = await api('/api/settings');
         settingsForm.cleanupPeriodDays = data.cleanupPeriodDays;
+        settingsFilePath.value = data.settingsFilePath || '';
       } catch (e) {
         toast('加载设置失败: ' + e.message, 'error');
       }
@@ -414,12 +462,14 @@ const app = createApp({
       currentView, loading, projects, stats, sessions, selectedSessions, sessionFilter, hideEmpty,
       currentProject, currentProjectDisplay, currentSessionId, detailMessages, detailMeta, detailFiles,
       globalSearch, searchKeyword, searchResults, toasts, confirmDialog,
-      trashData, trashCount, settingsForm, settingsSaving,
+      trashData, trashCount, settingsForm, settingsSaving, settingsFilePath,
+      orphanType, orphanItems, orphanTotalSize,
       totalSessions, debugInfo, fileHistoryInfo, filteredSessions, allSelected,
       goHome, openProject, openSession, backToSessions,
       toggleSelect, toggleSelectAll, batchDelete, deleteSingle,
       doGlobalSearch, highlightKeyword,
-      cleanupDebug, cleanupFileHistory,
+      cleanupDebug, cleanupFileHistory, openOrphans, deleteOrphan, cleanAllOrphans,
+      openInExplorer,
       openTrash, restoreFromTrash, permanentDelete, purgeTrash,
       openSettings, saveSettings,
       getUserText, getAssistantText, getToolCalls, stripTags, stripSystemTags,

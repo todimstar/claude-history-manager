@@ -205,21 +205,25 @@
                 <span class="fp-icon">📄</span>
                 <span class="fp-label">对话记录</span>
                 <code class="fp-path">{{ detailFiles.conversation }}</code>
+                <button class="btn btn-ghost btn-open" @click="openInExplorer(detailFiles.conversation)" title="在文件管理器中打开">📂</button>
               </div>
               <div class="fp-row" v-if="detailFiles.debug">
                 <span class="fp-icon">🐛</span>
                 <span class="fp-label">调试日志</span>
                 <code class="fp-path">{{ detailFiles.debug }}</code>
+                <button class="btn btn-ghost btn-open" @click="openInExplorer(detailFiles.debug)" title="在文件管理器中打开">📂</button>
               </div>
               <div class="fp-row" v-if="detailFiles.subagents">
                 <span class="fp-icon">🤖</span>
                 <span class="fp-label">子代理</span>
                 <code class="fp-path">{{ detailFiles.subagents }}</code>
+                <button class="btn btn-ghost btn-open" @click="openInExplorer(detailFiles.subagents)" title="在文件管理器中打开">📂</button>
               </div>
               <div class="fp-row" v-if="detailFiles.fileHistory">
                 <span class="fp-icon">📝</span>
                 <span class="fp-label">文件历史</span>
                 <code class="fp-path">{{ detailFiles.fileHistory }}</code>
+                <button class="btn btn-ghost btn-open" @click="openInExplorer(detailFiles.fileHistory)" title="在文件管理器中打开">📂</button>
               </div>
             </div>
           </div>
@@ -310,6 +314,59 @@
         </div>
       </template>
 
+      <!-- ════ 孤立文件列表 ════ -->
+      <template v-if="currentView === 'orphans'">
+        <div class="list-header">
+          <div class="left">
+            <button class="back-btn" @click="goHome">← 返回</button>
+            <h2>{{ orphanType === 'debug' ? '🐛 孤立调试日志' : '📝 孤立文件历史' }}</h2>
+            <span class="badge-info" v-if="orphanTotalSize">共占用 {{ orphanTotalSize }}</span>
+          </div>
+          <button class="btn btn-danger" :disabled="orphanItems.length === 0" @click="cleanAllOrphans">
+            全部清理 ({{ orphanItems.length }})
+          </button>
+        </div>
+
+        <!-- 说明卡片 -->
+        <div class="knowledge-card">
+          <div class="kc-title">📋 什么是「孤立」文件？</div>
+          <div class="kc-body">
+            <p v-if="orphanType === 'debug'">
+              以下是没有对应会话 <code>.jsonl</code> 的调试日志文件。可能是会话被手动删除或被 Claude Code 自动清理后遗留的。
+              这些文件已无法关联到任何对话，可安全删除。点击「打开」按钮可在文件管理器中查看确认。
+            </p>
+            <p v-else>
+              以下是没有对应会话 <code>.jsonl</code> 的文件编辑历史目录。每个目录保存了该次会话中 Claude 编辑文件的版本快照。
+              对应的会话已不存在，这些快照已无法关联到任何对话。点击「打开」按钮可在文件管理器中查看内容。
+            </p>
+          </div>
+        </div>
+
+        <div v-if="loading" class="loading"><div class="spinner"></div>加载中...</div>
+        <div v-else-if="orphanItems.length === 0" class="empty-state">没有孤立文件 ✨</div>
+        <div v-else class="orphan-list">
+          <div v-for="item in orphanItems" :key="item.sessionId" class="orphan-item">
+            <div class="orphan-body">
+              <div class="orphan-session">Session: {{ item.sessionId }}</div>
+              <div class="orphan-meta">
+                <span>💾 {{ item.sizeFormatted }}</span>
+                <span>🕐 {{ formatDate(item.lastModified) }}</span>
+                <span v-if="item.fileCount">📄 {{ item.fileCount }} 个文件</span>
+              </div>
+              <div class="orphan-path">
+                <code>{{ item.filePath || item.dirPath }}</code>
+              </div>
+            </div>
+            <div class="orphan-actions">
+              <button class="btn btn-ghost btn-open" @click.stop="openInExplorer(item.filePath || item.dirPath)" title="在文件管理器中打开">
+                📂 打开
+              </button>
+              <button class="btn btn-danger" @click.stop="deleteOrphan(item)">删除</button>
+            </div>
+          </div>
+        </div>
+      </template>
+
       <!-- ════ 设置 ════ -->
       <template v-if="currentView === 'settings'">
         <div class="list-header">
@@ -338,6 +395,11 @@
               <button class="btn btn-ghost" @click="settingsForm.cleanupPeriodDays = 30">30 天 (默认)</button>
               <button class="btn btn-ghost" @click="settingsForm.cleanupPeriodDays = 365">365 天 (推荐)</button>
               <button class="btn btn-ghost" @click="settingsForm.cleanupPeriodDays = 99999">99999 天 (永不清理)</button>
+            </div>
+            <div class="setting-file-row" v-if="settingsFilePath">
+              <span class="setting-file-label">📄 配置文件路径：</span>
+              <code class="fp-path">{{ settingsFilePath }}</code>
+              <button class="btn btn-ghost btn-open" @click="openInExplorer(settingsFilePath)" title="在文件管理器中打开，可手动确认修改">📂 打开</button>
             </div>
           </div>
         </div>
