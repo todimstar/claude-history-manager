@@ -249,12 +249,49 @@ async function extractCwdFromJsonl(projectDir) {
   return null;
 }
 
-/** 获取项目显示名（真实路径）— 优先级：history.jsonl > JSONL cwd > 正则解码（有损） */
+/**
+ * 智能路径解码：通过文件系统验证，逐级匹配实际存在的目录，解决连字符歧义
+ * 例：c--ep-code-frontend-claude-history-manager
+ *   → 逐级验证 C:\ep → C:\ep\code → C:\ep\code\frontend → C:\ep\code\frontend\claude-history-manager ✓
+ */
+function smartDecodePath(encodedName) {
+  const driveMatch = encodedName.match(/^([a-z])--(.+)$/);
+  if (!driveMatch) return null;
+  const basePath = driveMatch[1].toUpperCase() + ':\\';
+  const segments = driveMatch[2].split('-');
+  if (!segments.length) return null;
+
+  function resolve(dir, startIdx) {
+    if (startIdx >= segments.length) return dir;
+    // 从最长候选开始尝试（优先保留连字符）
+    for (let endIdx = segments.length; endIdx > startIdx; endIdx--) {
+      const candidate = segments.slice(startIdx, endIdx).join('-');
+      const candidatePath = path.join(dir, candidate);
+      try {
+        if (!fs.existsSync(candidatePath)) continue;
+        if (endIdx === segments.length) return candidatePath; // 已消费全部片段
+        if (fs.statSync(candidatePath).isDirectory()) {
+          const result = resolve(candidatePath, endIdx);
+          if (result) return result;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  return resolve(basePath, 0);
+}
+
+/** 获取项目显示名（真实路径）— 优先级：history.jsonl > JSONL cwd > 文件系统验证 > 正则解码（有损） */
 async function getProjectDisplayName(projectDir, encodedName, pathMap) {
-  if (pathMap && pathMap.has(encodedName)) return pathMap.get(encodedName);
+  if (pathMap && pathMap.has(encodedName)) return { displayName: pathMap.get(encodedName), isFallback: false };
   const cwd = await extractCwdFromJsonl(projectDir);
-  if (cwd) return cwd;
-  return encodedName.replace(/--/g, ':\\').replace(/-/g, '\\');
+  if (cwd) return { displayName: cwd, isFallback: false };
+  // 尝试文件系统智能解析
+  const smartResult = smartDecodePath(encodedName);
+  if (smartResult) return { displayName: smartResult, isFallback: false };
+  // 最终兜底：纯正则（有损，可能不准确）
+  return { displayName: encodedName.replace(/--/g, ':\\').replace(/-/g, '\\'), isFallback: true };
 }
 
 // ─── history.jsonl 同步 ─────────────────────────────────────
@@ -489,10 +526,11 @@ app.get('/api/projects', async (req, res) => {
       const dirPath = path.join(PROJECTS_DIR, e.name);
       const jsonlFiles = fs.readdirSync(dirPath).filter(f => f.endsWith('.jsonl'));
       const size = getDirSize(dirPath);
-      const displayName = await getProjectDisplayName(dirPath, e.name, pathMap);
+      const { displayName, isFallback } = await getProjectDisplayName(dirPath, e.name, pathMap);
       projects.push({
         name: e.name,
         displayName,
+        isFallback,
         sessionCount: jsonlFiles.length,
         size,
         sizeFormatted: formatBytes(size)

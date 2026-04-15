@@ -104,6 +104,7 @@
           <div class="project-grid">
             <div v-for="proj in projects" :key="proj.name" class="project-card" @click="openProject(proj.name)">
               <div class="name">{{ proj.displayName }}</div>
+              <div v-if="proj.isFallback" class="fallback-hint" title="路径由正则推断，可能不准确。新建一次对话即可自动修正。">⚠️ 路径推断</div>
               <div class="meta">
                 <span>💬 {{ proj.sessionCount }} 会话</span>
                 <span>💾 {{ proj.sizeFormatted }}</span>
